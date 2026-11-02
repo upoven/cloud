@@ -146,7 +146,7 @@
         </el-button>
       </div>
     </el-dialog>
-    <a v-show="settingStore.settings.projectLink" class="github" href="https://github.com/btc3149-bit/cloud">
+    <a v-show="settingStore.settings.projectLink" class="github" href="https://github.com/btc3149-bit/cloud-mail">
       <Icon icon="mingcute:github-line" color="#1890ff" width="20" height="20" />
     </a>
   </div>

@@ -6,10 +6,10 @@
         <a href="https://www.cloudflare.com/" target="_blank">
             <img src="https://img.shields.io/badge/Cloudflare-F38020?labelColor=F38020&amp;color=F38020&amp;logo=cloudflare&amp;logoColor=white" alt="Cloudflare" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud/releases" target="_blank" >
-            <img src="https://img.shields.io/github/v/release/btc3149-bit/cloud?logo=github&amp;logoColor=white" alt="releases" />
+        <a href="https://github.com/btc3149-bit/cloud-mail/releases" target="_blank" >
+            <img src="https://img.shields.io/github/v/release/btc3149-bit/cloud-mail?logo=github&amp;logoColor=white" alt="releases" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud/tree/main?tab=MIT-1-ov-file" target="_blank" >
+        <a href="https://github.com/btc3149-bit/cloud-mail/tree/main?tab=MIT-1-ov-file" target="_blank" >
             <img src="https://img.shields.io/badge/license-MIT-green" />
         </a>
     </p>
@@ -102,7 +102,7 @@ With only one domain, you can create multiple different email addresses, similar
 ## Project Structure
 
 ```
-cloud
+cloud-mail
 ├── mail-worker                    # Backend worker project
 │   ├── src
 │   │   ├── api                    # API layer
