@@ -104,7 +104,33 @@ jobs:
           echo "wrangler.toml: $([ -f "$WDIR/wrangler.toml" ] && echo yes || echo no)"
           echo "npx: $(command -v npx || echo MISSING) | node: $(node -v 2>&1)"
           echo "---------------------"
-          (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy 2>&1) | tee -a /tmp/deploy.log
+
+          # ★★ 2026-11-02：用 wrangler 的 --var 注入 Hub 托管的 worker vars ★★
+          #
+          #   缺陷（cloud-mail 实测）：上游 [vars] 是**配置模板**，关键项被注释掉：
+          #       #admin = ""  /  #jwt_secret = ""  /  #domain = []
+          #   期望用户自己取消注释填值。Hub 直接部署 → 变量全空 →
+          #   站点能打开但报「数据库未初始化」→ 客户拿到坏站点而 Hub 显示成功。
+          #
+          #   ★ 为什么用 --var 而不是改 wrangler.toml：
+          #     ① 改仓库文件会被**上游同步覆盖**（实测：改完一次 sync 就变回注释模板）
+          #     ② 在 CI 里 sed 合并 TOML 的转义极易出错（本文件已踩过 5 次）
+          #     --var 是 wrangler 原生能力，只影响本次部署，仓库保持干净。
+          #
+          #   ★ 合并而不是覆盖：--var 只补/改列出的键，配置里其它 vars 原样保留。
+          VAR_ARGS=""
+          VAR_COUNT=$(jq -r '.worker_vars // {} | length' config.json 2>/dev/null || echo 0)
+          if [ "$VAR_COUNT" != "0" ] && [ -n "$VAR_COUNT" ]; then
+            echo "--- 注入 $VAR_COUNT 个 worker vars ---"
+            VAR_LINES=$(jq -r '.worker_vars // {} | to_entries[] | "\(.key):\(.value | if type == "string" then . else tojson end)"' config.json)
+            while IFS= read -r kv; do
+              [ -z "$kv" ] && continue
+              echo "  $(echo "$kv" | cut -d: -f1)"
+              VAR_ARGS="$VAR_ARGS --var $kv"
+            done <<< "$VAR_LINES"
+          fi
+
+          (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy $VAR_ARGS 2>&1) | tee -a /tmp/deploy.log
           RC=$?
           if [ "$RC" != "0" ]; then echo "❌ backend wrangler exit=$RC"; exit "$RC"; fi
       # ★ Secret 注入必须是**独立步骤**，不能塞在 Deploy Backend Worker 里。
