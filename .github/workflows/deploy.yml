@@ -1,0 +1,265 @@
+# .github/workflows/deploy.yml
+name: deploy
+on:
+  repository_dispatch:
+    types: [cf-deploy]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Fetch deploy config
+        run: |
+          curl -fsS -X POST -H "X-Deploy-Token: ${DEPLOY_TOKEN}" "${HUB_URL}/api/config/exchange" -o config.json
+          echo "config fetched for project $(jq -r .name config.json) (project_id=${PROJECT_ID}, token redacted)"
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          DEPLOY_TOKEN: ${{ github.event.client_payload.deploy_token }}
+          PROJECT_ID: ${{ github.event.client_payload.project_id || 'local' }}
+      - name: Install
+        if: ${{ env.INSTALL != 'skip' }}
+        run: |
+          # ★★ 2026-11-02：先无条件把 pnpm/yarn 装上，再决定装依赖 ★★
+          #
+          #   缺陷（cloud-mail 实测）：原来整个 Install 步骤包在
+          #   原来的 if [ -f package.json ] 判断 —— 而 monorepo 的根目录**没有** package.json
+          #   （依赖在 mail-worker/ 与 mail-vue/）→ corepack enable 从未执行 →
+          #   后面 wrangler 的 [build] command（pnpm --prefix ../mail-vue ...）报
+          #     /bin/sh: 1: pnpm: not found   (exit 127)
+          #   客户看到的是「构建失败」，但真实原因只是「runner 上没有 pnpm」。
+          #
+          #   ★ 为什么无条件装：wrangler 的 [build] command 可能用任何包管理器，
+          #     而 Install 步骤看不到那个 command 的内容。宁可多装一个 corepack（几秒），
+          #     也不要让「包管理器缺失」伪装成「构建失败」。
+          #
+          #   ★ 版本选择：优先读根目录 package.json 的 packageManager 字段；
+          #     没有就用 pnpm@9（wrangler v4 与大多数仓库兼容的稳定版）。
+          corepack enable 2>/dev/null || true
+          ROOT_PM=""
+          [ -f package.json ] && ROOT_PM=$(jq -r '.packageManager // ""' package.json)
+          if [[ "$ROOT_PM" == pnpm@* ]]; then
+            corepack prepare "$ROOT_PM" --activate || true
+          else
+            # 找任意一级子目录的 pnpm-lock.yaml，用它的 pnpm 主版本
+            SUBPM=""
+            for lk in */pnpm-lock.yaml pnpm-lock.yaml; do
+              [ -f "$lk" ] || continue
+              v=$(grep -m1 '^lockfileVersion:' "$lk" | sed 's/.*: *//')
+              # lockfileVersion 9.x → pnpm 9/10；6.x → pnpm 8
+              case "$v" in 9*) SUBPM="pnpm@9" ;; 6*) SUBPM="pnpm@8" ;; *) SUBPM="" ;; esac
+              [ -n "$SUBPM" ] && break
+            done
+            [ -n "$SUBPM" ] && corepack prepare "$SUBPM" --activate || true
+          fi
+          echo "pnpm: $(pnpm -v 2>/dev/null || echo '(未安装)')"
+          echo "yarn: $(yarn -v 2>/dev/null || echo '(未安装)')"
+          echo "npm:  $(npm -v 2>/dev/null || echo '(无)')"
+
+          # 装依赖：只装「有 package.json 的那一层」
+          if [ -f package.json ]; then
+            PM="$ROOT_PM"
+            if [ -f pnpm-lock.yaml ] || [[ "$PM" == pnpm@* ]]; then
+              pnpm install --frozen-lockfile || pnpm install
+            elif [ -f yarn.lock ] || [[ "$PM" == yarn@* ]]; then
+              yarn install --frozen-lockfile || yarn install
+            else
+              npm ci || npm install
+            fi
+          else
+            echo "根目录无 package.json（monorepo），依赖由各子项目自己的步骤安装"
+          fi
+        env: { INSTALL: 'auto' }
+      - name: Build
+        run: |
+          set -o pipefail
+          # build_env 注入（如 VITE_API_BASE 指向后端 worker 地址），构建命令执行前生效
+          # ★ jq 的字符串插值语法是 (.key)。这段在 TS 模板字符串里，必须写 \( 才能
+          #   在生成的 yml 里留下一个反斜杠 —— 写 ( 会被 JS 解析成 ( ，jq 拿到
+          #   "export (.key)=(.value | @sh)" 就原样输出字面量，source 时报语法错误，
+          #   又被 || true 吞掉 → build_env 静默失效（2026-10-29 客户 livechat 撞出，P1）。
+          jq -r '.build_env // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' config.json > /tmp/buildenv.sh || true
+          [ -f /tmp/buildenv.sh ] && source /tmp/buildenv.sh || true
+          BUILD_CMD=$(jq -r '.build_command // ""' config.json)
+          if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD" 2>&1 | tee -a /tmp/deploy.log; fi
+      - name: Deploy Backend Worker
+        run: |
+          set -o pipefail
+          WDIR=$(jq -r '.worker_deploy.dir // ""' config.json)
+          if [ -z "$WDIR" ]; then echo "无后端 worker（纯前端项目），跳过"; exit 0; fi
+          if [ ! -f "$WDIR/wrangler.toml" ] && [ ! -f "$WDIR/wrangler.json" ] && [ ! -f "$WDIR/wrangler.jsonc" ]; then
+            echo "⚠ $WDIR 里没有 wrangler 配置，跳过后端部署"; exit 0
+          fi
+          echo "Deploying backend worker from $WDIR (before Pages: Pages service binding requires target worker to exist)"
+          if [ -f "$WDIR/package.json" ]; then
+            (cd "$WDIR" && (npx pnpm install --no-frozen-lockfile 2>/dev/null || npm install --no-audit --no-fund)) || echo "⚠ worker 依赖安装报错，继续尝试部署"
+          fi
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          # ★ 2026-11-02：wrangler 无输出直接 exit 1 时，先把现场打出来 ——
+          #   之前 (cd "$DIR" && ...) | tee 把 npx 的错误吞了，客户只看到「部署失败」四个字。
+          echo "--- wrangler 现场 (backend) ---"
+          echo "pwd=$(pwd) WDIR=$WDIR"; ls -la "$WDIR" 2>&1 | head -20
+          echo "wrangler.toml: $([ -f "$WDIR/wrangler.toml" ] && echo yes || echo no)"
+          echo "npx: $(command -v npx || echo MISSING) | node: $(node -v 2>&1)"
+          echo "---------------------"
+          (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy 2>&1) | tee -a /tmp/deploy.log
+          RC=$?
+          if [ "$RC" != "0" ]; then echo "❌ backend wrangler exit=$RC"; exit "$RC"; fi
+      # ★ Secret 注入必须是**独立步骤**，不能塞在 Deploy Backend Worker 里。
+      #   原因（2026-10-29 客户 livechat 撞出）：worker 目标的 worker_deploy.dir 为空，
+      #   Deploy Backend Worker 第 2 行就 exit 0，里面的 secret 注入整段被跳过 ——
+      #   结果是 Worker 部署成功但 ADMIN_PASSWORD 没注入，管理后台登不进去（功能不完整）。
+      #   Pages+worker combo 场景同样要在 worker 起来之后才能 put secret。
+      #   顺序：必须在 worker 首次部署之后（wrangler secret put 要求 script 已存在）。
+      - name: Deploy
+        run: |
+          set -o pipefail
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          TARGET_TYPE=$(jq -r .target_type config.json)
+          NAME=$(jq -r .name config.json)
+          if [ "$TARGET_TYPE" = "worker" ]; then
+            # worker（含合并部署）：在 wrangler 配置所在目录执行 deploy（Hub 已把 deploy_dir 写进 config.json）
+            DIR=$(jq -r '.deploy_dir // ""' config.json)
+            [ -n "$DIR" ] && [ -d "$DIR" ] || DIR="."
+            echo "wrangler deploy in $DIR"
+            # ★★ assets 目录自动纠正（2026-11-02，maillab/cloud-mail 撞出）★★
+            #
+            #   缺陷形状：上游 wrangler 配置写 `[assets] directory = "./dist"`（相对配置目录），
+            #   但它的 `[build] command` 是 `pnpm --prefix ../mail-vue run build` ——
+            #   产物落在 **mail-vue/dist**，不是 mail-worker/dist。
+            #   上游靠 CI 里设 VITE_OUT_DIR 或改 config 解决；Hub 直接 wrangler deploy
+            #   就会报 `The directory "./dist" specified in [assets] does not exist`。
+            #
+            #   判据：声明的 assets 目录**不存在**，但仓库里能找到**唯一一个** dist/build 目录
+            #   → 认定「产物与 config 分居两处」，把 config 的 directory 改指向它。
+            #   ★ 只在「唯一」时改：多个候选时无法判断哪个对，宁可让 wrangler 原样报错 ——
+            #     自动猜错会部署出一个空站点，比报错更难查。
+            ( cd "$DIR"
+              CFG=$(ls wrangler.toml 2>/dev/null | head -1)
+              if [ -n "$CFG" ] && grep -q '^[assets]' "$CFG"; then
+                ADIR=$(awk '/^\[assets\]/{f=1;next} /^\[/{f=0} f && /^[[:space:]]*directory[[:space:]]*=/{sub(/.*=[[:space:]]*"/,""); sub(/".*/,""); print; exit}' "$CFG")
+                if [ -n "$ADIR" ] && [ ! -d "$ADIR" ]; then
+                  # ★ 不用 find 的分组括号：TS 模板字符串会把反斜杠加左括号吃掉，
+                  #   导致 shell 报 syntax error near unexpected token。2026-11-02 实测。
+                  #   也不用花括号分组（美元符加左花括号会被当成模板插值）。
+                  #   正解：两次独立 find（各自带完整过滤条件），再用 echo 拼接。
+                  CANDS=$(find .. -maxdepth 3 -type d -name dist -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null)
+                  CANDS2=$(find .. -maxdepth 3 -type d -name build -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null)
+                  CANDS=$(echo "$CANDS"; echo "$CANDS2" | grep -v "^$" | head -5)
+                  N=$(printf "%s" "$CANDS" | grep -c . || true)
+                  if [ "$N" = "1" ]; then
+                    REL=$(realpath -m --relative-to=. "$CANDS" 2>/dev/null || echo "$CANDS")
+                    echo "⚠ assets 目录 $ADIR 不存在，改指向 $REL（仓库里唯一的构建产物目录）"
+                    sed -i "/^\[assets\]/,/^\[/ s|^[[:space:]]*directory[[:space:]]*=.*|directory = \"$REL\"|" "$CFG"
+                    sed -n '/^\[assets\]/,/^\[/p' "$CFG"
+                  elif [ "$N" = "0" ]; then
+                    echo "⚠ assets 目录 $ADIR 不存在，仓库里也没有 dist/build 目录 → 构建可能没跑成功"
+                  else
+                    echo "⚠ assets 目录 $ADIR 不存在，有 $N 个候选，无法确定用哪个（保持原配置让 wrangler 报错）："
+                    printf '%s\n' "$CANDS" | sed 's/^/     /'
+                  fi
+                fi
+              fi
+            )
+            echo "--- wrangler 现场 (main) ---"
+            echo "pwd=$(pwd) DIR=$DIR"; ls -la "$DIR" 2>&1 | head -25
+            echo "wrangler.toml: $([ -f "$DIR/wrangler.toml" ] && echo yes || echo no)"
+            echo "npx: $(command -v npx || echo MISSING) | node: $(node -v 2>&1)"
+            echo "--- 当前 [assets] 段 ---"; grep -A6 -E "^[[]assets[]]" "$DIR/wrangler.toml" 2>&1 | head -10
+            echo "--- dist 目录 ---"; ls -la "$DIR"/dist 2>&1 | head -5 || true; echo "--- ../mail-vue/dist（可选）---"; ls -la ../mail-vue/dist 2>&1 | head -5 || true
+            echo "---------------------"
+            (cd "$DIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy 2>&1) | tee -a /tmp/deploy.log
+            RC=$?
+            if [ "$RC" != "0" ]; then echo "❌ main wrangler exit=$RC"; exit "$RC"; fi
+          else
+            OUT=$(jq -r '.output_dir // "dist"' config.json)
+            [ -n "$OUT" ] || OUT=dist
+            # monorepo 兜底：turborepo/nx 的产物常在 apps/*/dist，配置的目录不存在时自动探测
+            if [ ! -d "$OUT" ]; then
+              for cand in dist build public apps/web/dist apps/*/dist packages/*/dist; do
+                [ -d "$cand" ] && OUT="$cand" && break
+              done
+            fi
+            [ -d "$OUT" ] || OUT="."
+            # pages_dir 模式（前端+Functions 一体）：从该目录部署，wrangler 自动打包旁边的 functions/ 为 Pages Functions
+            PDIR=$(jq -r '.pages_dir // ""' config.json)
+            if [ -n "$PDIR" ] && [ -d "$PDIR" ]; then
+              OUT_ABS=$(realpath -m "$OUT")
+              echo "pages deploy from $PDIR (output $OUT_ABS, functions bundled)"
+              (cd "$PDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler pages deploy "$OUT_ABS" --project-name "$NAME" --branch main 2>&1) | tee -a /tmp/deploy.log
+            else
+              # wrangler v4 已移除 --account-id 参数，改用 CLOUDFLARE_ACCOUNT_ID 环境变量
+              CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler pages deploy "$OUT" --project-name "$NAME" --branch main 2>&1 | tee -a /tmp/deploy.log
+            fi
+          fi
+      # ★ Secret 注入必须是**独立步骤**，且必须在 Deploy **之后**。
+      #   为什么不能塞在 Deploy Backend Worker 里（2026-10-29 客户 livechat 撞出）：
+      #     worker 目标的 worker_deploy.dir 为空 → Deploy Backend Worker 第 2 行就 exit 0
+      #     → 里面的 secret 注入整段被跳过 → Worker 部署成功但 ADMIN_PASSWORD 没注入
+      #     → 管理后台登录报「未初始化管理员密码」→ 客户拿到一个登不进去的站。
+      #   为什么必须在 Deploy 之后：wrangler secret put 要求目标 script 已存在，
+      #     先 put 会报 "The script does not exist"。
+      - name: Inject Worker Secrets
+        run: |
+          set -o pipefail
+          N=$(jq -r '.worker_secrets // {} | length' config.json)
+          if [ "$N" = "0" ]; then echo "无 worker secrets，跳过"; exit 0; fi
+          # worker 目标的 deploy_dir 与 pages-combo 的 worker_deploy.dir 都认
+          WDIR=$(jq -r '.deploy_dir // ""' config.json)
+          if [ -z "$WDIR" ]; then WDIR=$(jq -r '.worker_deploy.dir // ""' config.json); fi
+          if [ -z "$WDIR" ]; then WDIR="."; fi
+          if [ ! -f "$WDIR/wrangler.toml" ] && [ ! -f "$WDIR/wrangler.json" ] && [ ! -f "$WDIR/wrangler.jsonc" ]; then
+            echo "⚠ $WDIR 里没有 wrangler 配置，无法注入 secret"; exit 0
+          fi
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          # ★ 同 Build 步骤的坑：(.key) 在 TS 模板字符串里必须写 \(.key)。
+          #   写单反斜杠会被 JS 吞成 ( ，jq 原样输出 "(.key)<TAB>(.value)"，
+          #   结果 secret 名字被写成字面量 (.key)，ADMIN_PASSWORD 根本没注入，
+          #   而 wrangler secret put 对任意名字都成功 → CI 显示绿色但功能是坏的。
+          #   ★ IFS=$'	' 同样要写 $'\t'，让生成的 yml 里是 $'	'（bash 再解释成真 tab），
+          #     而不是让 TS 直接塞一个真 tab 进去 —— 后者肉眼看不见，改起来极易改错。
+          #
+          # ★★ 值必须走 base64，不能直接 (.value)（2026-10-30 实测，探针 .review/p8/run.sh）：
+          #   read -r K V 是**按行**读的。值里一旦有换行（Worker 的 PEM 私钥就是典型），
+          #   jq 把换行原样吐出来，循环就把第一行当值、把后面每一行当成**新的 secret 名**。
+          #   实测：7 个 secret 变成 9 次注入，3 个值被改坏 ——
+          #       JWT_PRIVATE_KEY   87 字节 -> 27（只剩第一行）
+          #       MIIEvQIBADAN...     ← PEM 第二行被当成 secret 名，注入了一个 0 字节的垃圾
+          #       -----END PRIVATE KEY-----  ← 第三行同上
+          #       TAB_LEAD 5->4、TRAIL_TAB 5->4（read 剥掉前导/尾随 IFS）
+          #   而 wrangler secret put 对任意名字都成功 → **CI 全绿，坏的只是功能**。
+          #   ★ 边界（实测，别信「特殊字符都不行」这种笼统说法）：
+          #     · 值**中间**的制表符是安全的（IFS=$'	' 只切第一个，余下全归 V）
+          #     · 值**尾**的空格是安全的（IFS 里没有空格）
+          #     · 真正不安全的只有三种：换行、值以 	 开头、值以 	 结尾
+          #   ★ 边界2：tostring 在 jq 1.7 上是**冗余**的。2026-10-30 实测 libjq 1.7.1：
+          #     @base64 对 number/boolean/null 会隐式 tostring（30 -> MzA=），
+          #     去掉 tostring 后探针**全绿**（变异 c，等价变异，不改变行为）。
+          #     保留它只为一件事：jq 1.6 的 @base64 只吃字符串，而 runner 的 jq 版本
+          #     不由我们控制。★ 这一条（1.6 会报错）**未在本机验证**，是兼容性保险。
+          #   ★ 边界3：runs-on 是 ubuntu-latest，所以用 GNU coreutils 的 base64 -d。
+          #     谁把 runs-on 改成 macos，这里必须换成 base64 -D；否则每个 secret 都注入失败，
+          #     而且失败只打一行 ⚠（被 || echo 吃掉），CI 照样绿。
+          #   ★ 边界4（写给下一个改这个文件的人）：这个模板是 JS 模板字符串，
+          #     **注释里不许出现反引号**。写一个就提前收尾，生成的 yml 从那里被截断，
+          #     而 tsc 不报错、run-tests 只有几条「步骤不存在」——排查成本极高。
+          jq -r '.worker_secrets // {} | to_entries[] | "\(.key)\t\(.value | tostring | @base64)"' config.json | while IFS=$'\t' read -r K V; do
+            [ -n "$K" ] || continue
+            echo "inject secret $K"
+            printf '%s' "$V" | base64 -d | (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler secret put "$K" 2>&1) | tee -a /tmp/deploy.log || echo "⚠ secret $K 注入失败（值已 base64；若日志报 invalid input，说明 jq 过滤器里的 @base64 丢了）"
+          done
+      - name: Report status
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          LOGS=$(tail -c 4000 /tmp/deploy.log 2>/dev/null || true)
+          jq -n --arg s "${STATUS}" --arg l "${LOGS}" '{status:$s,logs:$l}' > /tmp/req.json
+          curl -sS -X POST -H "X-Deploy-Token: ${DEPLOY_TOKEN}" -H "Content-Type: application/json" -d @/tmp/req.json "${HUB_URL}/api/deploys/${DEPLOY_ID}/status" || true
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          DEPLOY_TOKEN: ${{ github.event.client_payload.deploy_token }}
+          DEPLOY_ID: ${{ github.event.client_payload.deploy_id }}
