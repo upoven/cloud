@@ -39,6 +39,18 @@ run_worker_first = true
 
 
 [vars]
+# ---- 四家免费发信通道（2026-11-03 接入），凭据走 wrangler secret ----
+rot_warmup_enabled = "true"
+rot_warmup_start = "2026-11-02"
+rot_warmup_start_cap = "30"
+rot_warmup_step = "15"
+rot_warmup_step_days = "2"
+rot_warmup_max = "1050"
+rot_brevo_quota = "300"
+rot_sendpulse_quota = "400"
+rot_mailjet_quota = "200"
+rot_mailtrap_quota = "150"
+
 #ai_model = ""			#ai模型,不填默认使用@cf/meta/llama-3.1-8b-instruct-fast
 #analysis_cache = false			#是否开启分析数据缓存
 #orm_log = false			#是否sql日志
