@@ -10,6 +10,8 @@ import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
 import { Resend } from 'resend';
+// 四家免费服务商轮换（2026-11-03 接入）。CF / Resend 都没配时的兜底发信通道。
+import { sendViaRotator, rotatorConfigured } from './mail-rotator';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -413,9 +415,14 @@ const emailService = {
 		const domain = emailUtils.getDomain(accountRow.email);
 		const resendToken = resendTokens[domain];
 		const useCloudflareEmail = !!c.env.email;
+		// ★ 四家免费服务商轮换（Brevo/SendPulse/Mailjet/Mailtrap）是否可用。
+		//   2026-11-03 接入：本站 send_email 绑定名是 cloud（不是 email），
+		//   所以 useCloudflareEmail 恒为 false；Resend 也没配 token
+		//   → 接入前站外发信**一封都发不出去**。
+		const useRotator = !useCloudflareEmail && !resendToken && rotatorConfigured(c.env);
 
 		//如果接收方存在站外邮箱，又没有发信服务
-		if (!useCloudflareEmail && !resendToken && !allInternal) {
+		if (!useCloudflareEmail && !resendToken && !useRotator && !allInternal) {
 			throw new BizError(t('noSendProvider'));
 		}
 
@@ -471,14 +478,18 @@ const emailService = {
 			}
 		};
 
-		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend。
+		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend，最后四家轮换。
+		// ★ 顺序不能反：CF/Resend 是用户显式配置的付费通道，优先用；
+		//   四家免费轮换是**兜底**，只在两者都没配时接管。
 		let deliveries;
 		if (allInternal) {
 			deliveries = this.sendInternal(c, context);
 		} else if (useCloudflareEmail) {
 			deliveries = this.sendCloudflare(c, context);
-		} else {
+		} else if (resendToken) {
 			deliveries = this.sendResend(c, context);
+		} else {
+			deliveries = this.sendRotator(c, context);
 		}
 
 		const emailResults = [];
@@ -540,6 +551,42 @@ const emailService = {
 			}
 			const emailResult = await this.saveSentEmail(c, {
 				...saveParams, receiveEmail, providerId: result.data.id
+			});
+			yield { emails: [emailResult] };
+		}
+	},
+
+	// 四家免费服务商轮换（Brevo / SendPulse / Mailjet / Mailtrap）。
+	//
+	// ★ 为什么单独一条分支（2026-11-03）：
+	//   本站 send_email 绑定名是 cloud（不是 email），useCloudflareEmail 恒 false；
+	//   Resend 也没配 token → 接入前站外发信全部报 noSendProvider。
+	//   这条分支是**兜底**，只在 CF / Resend 都没配时接管。
+	//
+	// ★ 与 sendResend 的差异：四家都不支持批量数组（每家一次一个收件人列表），
+	//   所以分开发送时逐人调用；普通发送把整个收件人列表交给一家。
+	//   rotator 内部已经做了 failover（一家失败换下一家），这里不再重试。
+	async *sendRotator(c, { separate, sendParams, saveParams }) {
+		const recipientGroups = separate
+			? sendParams.receiveEmail.map(address => [address])
+			: [sendParams.receiveEmail];
+		for (const receiveEmail of recipientGroups) {
+			let result;
+			try {
+				result = await sendViaRotator(c.env, {
+					from: { name: sendParams.name, email: sendParams.accountEmail },
+					to: receiveEmail,
+					subject: sendParams.subject,
+					html: sendParams.html,
+					text: sendParams.text,
+				});
+			} catch (error) {
+				if (!separate) throw error;
+				yield { error: { message: error.message } };
+				return;
+			}
+			const emailResult = await this.saveSentEmail(c, {
+				...saveParams, receiveEmail, providerId: result.id
 			});
 			yield { emails: [emailResult] };
 		}
