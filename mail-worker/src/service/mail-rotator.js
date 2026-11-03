@@ -83,7 +83,28 @@ function providerCfg(env) {
   };
 }
 
-/** 选出候选（剩余额度 desc, priority asc），并受 warm-up 全局上限约束 */
+/**
+ * 选路：round-robin（轮询）。
+ *
+ * ★ 为什么从「剩余额度最多优先」改成轮询（2026-11-03 用户要求）：
+ *   旧策略下 SendPulse 额度最大（400）→ 永远排第一 → 连续 3 封外发**全部**走它，
+ *   另外三家长期闲置。验收 agent 实测抓到了这一点：「四家轮换」实际上只有一家在工作。
+ *   闲置的通道等于没验证过 —— 真需要降级时才发现它根本发不出去。
+ *
+ * ★ 轮询游标存 KV（`rot:cursor`）：
+ *   · 值是「上一次成功使用的 provider 在 PROVIDERS 里的下标 + 1」
+ *   · KV 是最终一致的，并发下偶尔会重复选同一家 —— 对轮询语义无害，不追求严格
+ *   · 每封邮件一次 KV 写，1050 封/天完全可接受
+ *
+ * ★ 仍然保留的约束（轮询不等于无视可用性）：
+ *   · 未配置凭据的跳过
+ *   · 今日额度已满的跳过
+ *   · 带附件时跳过附件接口不可用的（见 ATTACH_UNSUPPORTED）
+ *   · warm-up 全局上限仍然生效
+ *
+ * ★ 返回的列表**顺序就是尝试顺序**：先试游标指向的那家，失败再按轮转顺序往下试。
+ *   这样既做到了负载均衡，又保留了 failover。
+ */
 export async function pickProviders(env, opts = {}) {
   const cfg = providerCfg(env);
   const cap = warmupCap(env);
@@ -93,18 +114,40 @@ export async function pickProviders(env, opts = {}) {
   const globalRoom = cap - totalSent;
   if (globalRoom <= 0) return [];
   const needAttach = !!opts.hasAttachments;
+  const cursor = await getCursor(env);
+  const start = PROVIDERS.length ? (cursor % PROVIDERS.length) : 0;
+
+  // 从游标位置开始，按 PROVIDERS 顺序环形展开
+  const order = [];
+  for (let i = 0; i < PROVIDERS.length; i++) order.push(PROVIDERS[(start + i) % PROVIDERS.length]);
+
   const out = [];
-  for (const p of PROVIDERS) {
+  for (const p of order) {
     const c = cfg[p];
     if (!c.enabled) continue;
-    // ★ 带附件时跳过「已知不支持附件」的服务商（见 ATTACH_FAIL 说明）
+    // 带附件时跳过「已知不支持附件」的服务商（见 ATTACH_UNSUPPORTED 说明）
     if (needAttach && ATTACH_UNSUPPORTED.has(p)) continue;
     const remain = c.quota - counts[p];
     if (remain <= 0) continue;
-    out.push({ name: p, cfg: c, remain });
+    out.push({ name: p, cfg: c, remain, idx: PROVIDERS.indexOf(p) });
   }
-  out.sort((a, b) => (b.remain - a.remain) || (a.cfg.priority - b.cfg.priority));
   return out.slice(0, Math.max(1, Math.min(out.length, globalRoom)));
+}
+
+/** 读轮询游标（KV 读失败按 0 处理，退化成从第一家开始，不影响正确性） */
+async function getCursor(env) {
+  try {
+    const v = await env.kv.get('rot:cursor');
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch { return 0; }
+}
+
+/** 推进游标到「刚用过的下一家」。失败不抛 —— 轮询指针错一次不影响发信。 */
+async function bumpCursor(env, usedIdx) {
+  try {
+    await env.kv.put('rot:cursor', String((usedIdx + 1) % Math.max(1, PROVIDERS.length)));
+  } catch { /* 指针写失败不影响发信，下次可能重复选同一家 */ }
 }
 
 /**
@@ -327,6 +370,10 @@ export async function sendViaRotator(env, { from, to, subject, html, text, attac
     try {
       const out = await ADAPTERS[c.name](env, from, to, subject, html, text, { attachments: atts, replyTo });
       await incrSent(env, c.name, to.length);
+      // ★ 只有**成功**才推进轮询游标。
+      //   失败的那家不能占用轮转位 —— 否则每次轮到它就失败、下次又轮到它，
+      //   另外几家永远拿不到流量。
+      await bumpCursor(env, c.idx);
       return { provider: c.name, id: out?.id || null };
     } catch (e) {
       errors.push(c.name + ': ' + e.message);
