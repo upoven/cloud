@@ -433,7 +433,7 @@
               <div class="concerning-item">
                 <span>{{ $t('version') }} :</span>
                 <el-badge is-dot :hidden="!hasUpdate">
-                  <el-button @click="jump('https://github.com/btc3149-bit/cloud-mail/releases')">
+                  <el-button @click="jump('https://probrook.com/cloud/releases')">
                     {{ currentVersion }}
                     <template #icon>
                       <Icon icon="qlementine-icons:version-control-16" style="font-size: 20px" color="#1890FF"/>
@@ -444,13 +444,13 @@
               <div class="concerning-item">
                 <span>{{ $t('community') }} : </span>
                 <div class="community">
-                  <el-button @click="jump('https://github.com/btc3149-bit/cloud-mail')">
+                  <el-button @click="jump('https://probrook.com/cloud')">
                     Github
                     <template #icon>
                       <Icon icon="codicon:github-inverted" width="22" height="22"/>
                     </template>
                   </el-button>
-                  <el-button @click="jump('https://t.me/+kUCdWP_WLWZjMzQx')">
+                  <el-button @click="jump('#')">
                     Telegram
                     <template #icon>
                       <Icon icon="logos:telegram" width="30" height="30"/>
@@ -460,7 +460,7 @@
               </div>
               <div class="concerning-item">
                 <span>{{ $t('support') }} : </span>
-                <el-button @click="jump('https://docs.skymail.ink/support.html')">
+                <el-button @click="jump('https://probrook.com')">
                   {{ t('supportDesc') }}
                   <template #icon>
                     <Icon color="#79D6B5" icon="simple-icons:buymeacoffee" width="20" height="20"/>
@@ -469,7 +469,7 @@
               </div>
               <div class="concerning-item">
                 <span>{{ $t('help') }} : </span>
-                <el-button @click="jump('https://docs.skymail.ink')">
+                <el-button @click="jump('https://probrook.com')">
                   {{ t('document') }}
                   <template #icon>
                     <Icon color="#79D6B5" icon="fluent-color:document-32" width="18" height="18"/>
@@ -1151,7 +1151,7 @@ const resendList = computed(() => {
 
 function getUpdate() {
   if (getUpdateErrorCount > 5 || !getUpdateErrorCount) return
-  axios.get('https://api.github.com/repos/btc3149-bit/cloud-mail/releases/latest').then(({data}) => {
+  axios.get('https://api.github.com/repos/upoven/cloud/releases/latest').then(({data}) => {
     hasUpdate.value = data.name !== currentVersion
     getUpdateErrorCount = 0
   }).catch(e => {
