@@ -566,10 +566,19 @@ const emailService = {
 	// ★ 与 sendResend 的差异：四家都不支持批量数组（每家一次一个收件人列表），
 	//   所以分开发送时逐人调用；普通发送把整个收件人列表交给一家。
 	//   rotator 内部已经做了 failover（一家失败换下一家），这里不再重试。
+	//
+	// ★★ 附件必须显式传下去（2026-11-03 验收抓出的 P0）★★
+	//   第一版漏了这一步：接口 200、后台显示「发送成功」、详情页还显示附件卡片，
+	//   但收件人收到的邮件只有 multipart/alternative，**没有附件**。
+	//   attList 其实早就入库了（能从后台下载回来），只是没传给服务商。
+	//   这类「接口绿、后台绿、收件人那边没有」的问题，只有端到端收信才能发现。
 	async *sendRotator(c, { separate, sendParams, saveParams }) {
 		const recipientGroups = separate
 			? sendParams.receiveEmail.map(address => [address])
 			: [sendParams.receiveEmail];
+		// 转成四家通用的 base64 形态（{ content, filename, contentType }）。
+		// 复用 toResendAttachments —— 它产出的正是这个形状，不必再写一份。
+		const attachments = await this.toResendAttachments(sendParams.attachments || []);
 		for (const receiveEmail of recipientGroups) {
 			let result;
 			try {
@@ -579,6 +588,8 @@ const emailService = {
 					subject: sendParams.subject,
 					html: sendParams.html,
 					text: sendParams.text,
+					attachments,
+					replyTo: sendParams.sendType === 'reply' ? sendParams.messageId : null,
 				});
 			} catch (error) {
 				if (!separate) throw error;
