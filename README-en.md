@@ -6,15 +6,15 @@
         <a href="https://www.cloudflare.com/" target="_blank">
             <img src="https://img.shields.io/badge/Cloudflare-F38020?labelColor=F38020&amp;color=F38020&amp;logo=cloudflare&amp;logoColor=white" alt="Cloudflare" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud-mail/releases" target="_blank" >
-            <img src="https://img.shields.io/github/v/release/btc3149-bit/cloud-mail?logo=github&amp;logoColor=white" alt="releases" />
+        <a href="https://probrook.com/cloud/releases" target="_blank" >
+            <img src="https://img.shields.io/github/v/release/upoven/cloud?logo=github&amp;logoColor=white" alt="releases" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud-mail/tree/main?tab=MIT-1-ov-file" target="_blank" >
+        <a href="https://probrook.com/cloud/tree/main?tab=MIT-1-ov-file" target="_blank" >
             <img src="https://img.shields.io/badge/license-MIT-green" />
         </a>
     </p>
     <p align="center">
-        <a href="https://skymail.ink">Live Demo</a> · <a href="https://docs.skymail.ink/en/">Deployment Guide</a> ·
+        <a href="https://probrook.com">Live Demo</a> · <a href="https://probrook.com">Deployment Guide</a> ·
         <a href="/README.md">简体中文</a> | English
     </p>
     <p align="center">
@@ -40,12 +40,12 @@ With only one domain, you can create multiple different email addresses, similar
 <table>
   <tr>
     <td valign="middle">
-      <a href="https://github.com/pixtalelab/pixtale">
+      <a href="https://github.com/upoven/cloud">
         <img width="30" src="https://img.022335.xyz/logo.png" alt="Pixtale" align="middle">
       </a>
     </td>
     <td valign="middle">
-      <a href="https://github.com/pixtalelab/pixtale">Pixtale</a>
+      <a href="https://github.com/upoven/cloud">Pixtale</a>
     </td>
     <td valign="middle">
       A self-hosted cloud storage photo album app
@@ -102,7 +102,7 @@ With only one domain, you can create multiple different email addresses, similar
 ## Project Structure
 
 ```
-cloud-mail
+cloud
 ├── mail-worker                    # Backend worker project
 │   ├── src
 │   │   ├── api                    # API layer
@@ -151,4 +151,4 @@ This project is licensed under the [MIT](LICENSE) license.
 
 ## Communication
 
-[Telegram](https://t.me/+kUCdWP_WLWZjMzQx)
+[Telegram](#)
