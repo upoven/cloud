@@ -22,6 +22,7 @@
 //   · KV 是最终一致的（写入后立刻读可能读不到），所以计数采用「先读后写 + 允许少量超发」，
 //     不用它做严格配额。真正超发时服务商会返回 4xx，failover 会兜住。
 //   · 不做 SQLite（Worker 无文件系统）。
+//   · **附件必须支持**（Python 版没有）：见下方 ATTACHMENTS 说明。
 import dayjs from 'dayjs';
 
 const PROVIDERS = ['brevo', 'sendpulse', 'mailjet', 'mailtrap'];
@@ -83,7 +84,7 @@ function providerCfg(env) {
 }
 
 /** 选出候选（剩余额度 desc, priority asc），并受 warm-up 全局上限约束 */
-export async function pickProviders(env) {
+export async function pickProviders(env, opts = {}) {
   const cfg = providerCfg(env);
   const cap = warmupCap(env);
   const counts = {};
@@ -91,10 +92,13 @@ export async function pickProviders(env) {
   const totalSent = Object.values(counts).reduce((a, b) => a + b, 0);
   const globalRoom = cap - totalSent;
   if (globalRoom <= 0) return [];
+  const needAttach = !!opts.hasAttachments;
   const out = [];
   for (const p of PROVIDERS) {
     const c = cfg[p];
     if (!c.enabled) continue;
+    // ★ 带附件时跳过「已知不支持附件」的服务商（见 ATTACH_FAIL 说明）
+    if (needAttach && ATTACH_UNSUPPORTED.has(p)) continue;
     const remain = c.quota - counts[p];
     if (remain <= 0) continue;
     out.push({ name: p, cfg: c, remain });
@@ -103,8 +107,49 @@ export async function pickProviders(env) {
   return out.slice(0, Math.max(1, Math.min(out.length, globalRoom)));
 }
 
+/**
+ * 已知附件接口不可用的服务商。
+ *
+ * ★ 2026-11-03 实测：SendPulse 的 /smtp/emails 带 attachments 时，
+ *   无论用哪种字段名（name/type/content、filename、file_name）**一律返回
+ *   500 Internal server error**。不带附件则正常。
+ *   而 rotator 的语义是「附件必须发出去」—— 静默丢掉附件比发失败更糟
+ *   （客户以为附件发了，收件人那边没有；验收就是这样抓到的）。
+ *   所以带附件时直接跳过它，交给 Brevo / Mailjet / Mailtrap。
+ *   若将来 SendPulse 修好了，把这个名字从集合里删掉即可。
+ */
+const ATTACH_UNSUPPORTED = new Set(['sendpulse']);
+
 // ---------------------------------------------------------------
-// 四家适配器：统一签名 (env, from, to, subject, html, text) -> { id }
+// ATTACHMENTS
+//
+// ★★ 第一版漏了附件（2026-11-03 验收抓出的 P0）★★
+//   接口返回 200、后台显示「发送成功」、详情页还显示附件卡片，
+//   但收件人收到的只有 multipart/alternative，**没有附件**。
+//   原因是组装请求体时压根没读 attList —— 附件早就入库了（能从后台下载回来）。
+//   这类「接口绿、后台绿、收件人那边没有」的问题只有端到端收信能发现。
+//
+// 统一形态（与 Resend SDK 一致，调用方用 toResendAttachments 转换）：
+//   { content: base64 字符串, filename: string, contentType: string, contentId?: string }
+//   · contentId 存在 = 内嵌图片（cid:），否则是普通附件
+// ---------------------------------------------------------------
+
+/** 四家 API 通用的附件数组（Brevo / Mailjet / Mailtrap 用 base64 + filename） */
+function baseAttachments(attachments) {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  return attachments
+    .filter((a) => a && a.content && a.filename)
+    .map((a) => ({
+      content: String(a.content).replace(/\s+/g, ''),
+      name: String(a.filename),
+      type: String(a.contentType || a.mimeType || 'application/octet-stream'),
+      contentId: a.contentId ? String(a.contentId).replace(/^<|>$/g, '') : null,
+    }));
+}
+
+// ---------------------------------------------------------------
+// 四家适配器：统一签名 (env, from, to, subject, html, text, opts) -> { id }
+// opts: { attachments, replyTo }
 // 失败抛异常 → 由调用方 failover
 // ---------------------------------------------------------------
 
@@ -120,7 +165,13 @@ async function httpJson(url, opts) {
   } finally { clearTimeout(timer); }
 }
 
-async function sendBrevo(env, from, to, subject, html, text) {
+function replyHeaders(replyTo) {
+  return replyTo ? { 'in-reply-to': replyTo, references: replyTo } : null;
+}
+
+async function sendBrevo(env, from, to, subject, html, text, opts = {}) {
+  const atts = baseAttachments(opts.attachments);
+  const hdr = replyHeaders(opts.replyTo);
   const r = await httpJson('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': envKey(env, 'BREVO_API_KEY'), 'Content-Type': 'application/json' },
@@ -130,6 +181,9 @@ async function sendBrevo(env, from, to, subject, html, text) {
       subject,
       htmlContent: html,
       ...(text ? { textContent: text } : {}),
+      // Brevo 用 attachment（普通）与 headers 里的回复头
+      ...(atts.length ? { attachment: atts.filter((a) => !a.contentId).map((a) => ({ content: a.content, name: a.name })) } : {}),
+      ...(atts.some((a) => a.contentId) ? { headers: { ...(hdr || {}), 'X-Hub-Inline': '1' } } : (hdr ? { headers: hdr } : {})),
     }),
   });
   if (!r.ok) throw new Error(`Brevo ${r.status}: ${JSON.stringify(r.body).slice(0, 160)}`);
@@ -153,8 +207,10 @@ async function sendpulseToken(env) {
   return spTokenCache.token;
 }
 
-async function sendSendpulse(env, from, to, subject, html, text) {
+async function sendSendpulse(env, from, to, subject, html, text, opts = {}) {
   const token = await sendpulseToken(env);
+  const atts = baseAttachments(opts.attachments);
+  const hdr = replyHeaders(opts.replyTo);
   const r = await httpJson('https://api.sendpulse.com/smtp/emails', {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
@@ -164,6 +220,15 @@ async function sendSendpulse(env, from, to, subject, html, text) {
         ...(text ? { text } : {}),
         from: { name: from.name, email: from.email },
         to: to.map((e) => ({ email: e })),
+        // SendPulse：attachments 里每项 { name, type, content(base64) }；
+        // 内嵌图片用 inline_attachments + content_id
+        ...(atts.filter((a) => !a.contentId).length
+          ? { attachments: atts.filter((a) => !a.contentId).map((a) => ({ name: a.name, type: a.type, content: a.content })) }
+          : {}),
+        ...(atts.some((a) => a.contentId)
+          ? { inline_attachments: atts.filter((a) => a.contentId).map((a) => ({ name: a.name, type: a.type, content: a.content, content_id: a.contentId })) }
+          : {}),
+        ...(hdr ? { headers: hdr } : {}),
       },
     }),
   });
@@ -173,8 +238,10 @@ async function sendSendpulse(env, from, to, subject, html, text) {
   return { id: null };
 }
 
-async function sendMailjet(env, from, to, subject, html, text) {
+async function sendMailjet(env, from, to, subject, html, text, opts = {}) {
   const basic = btoa(envKey(env, 'MAILJET_API_KEY') + ':' + envKey(env, 'MAILJET_SECRET_KEY'));
+  const atts = baseAttachments(opts.attachments);
+  const hdr = replyHeaders(opts.replyTo);
   const r = await httpJson('https://api.mailjet.com/v3.1/send', {
     method: 'POST',
     headers: { Authorization: 'Basic ' + basic, 'Content-Type': 'application/json' },
@@ -185,6 +252,14 @@ async function sendMailjet(env, from, to, subject, html, text) {
         Subject: subject,
         HTMLPart: html,
         ...(text ? { TextPart: text } : {}),
+        // Mailjet：Attachments = [{ ContentType, Filename, Base64Content }]
+        ...(atts.filter((a) => !a.contentId).length
+          ? { Attachments: atts.filter((a) => !a.contentId).map((a) => ({ ContentType: a.type, Filename: a.name, Base64Content: a.content })) }
+          : {}),
+        ...(atts.some((a) => a.contentId)
+          ? { InlinedAttachments: atts.filter((a) => a.contentId).map((a) => ({ ContentType: a.type, Filename: a.name, Base64Content: a.content, ContentID: a.contentId })) }
+          : {}),
+        ...(hdr ? { Headers: hdr } : {}),
       }],
     }),
   });
@@ -194,8 +269,10 @@ async function sendMailjet(env, from, to, subject, html, text) {
   return { id: r.body?.Messages?.[0]?.To?.[0]?.MessageID || null };
 }
 
-async function sendMailtrap(env, from, to, subject, html, text) {
+async function sendMailtrap(env, from, to, subject, html, text, opts = {}) {
   // ★ 端点必须是 send.api.mailtrap.io/api/send（不是 /api/v2/send）
+  const atts = baseAttachments(opts.attachments);
+  const hdr = replyHeaders(opts.replyTo);
   const r = await httpJson('https://send.api.mailtrap.io/api/send', {
     method: 'POST',
     headers: { 'Api-Token': envKey(env, 'MAILTRAP_API_TOKEN'), 'Content-Type': 'application/json' },
@@ -205,6 +282,17 @@ async function sendMailtrap(env, from, to, subject, html, text) {
       subject,
       html,
       ...(text ? { text } : {}),
+      // Mailtrap：attachments = [{ content(base64), filename, type, disposition }]
+      ...(atts.length
+        ? {
+            attachments: atts.map((a) => ({
+              content: a.content, filename: a.name, type: a.type,
+              disposition: a.contentId ? 'inline' : 'attachment',
+              ...(a.contentId ? { content_id: a.contentId } : {}),
+            })),
+          }
+        : {}),
+      ...(hdr ? { headers: hdr } : {}),
       category: 'transactional',
     }),
   });
@@ -224,15 +312,20 @@ const ADAPTERS = {
  * 对外统一入口：发一封站外邮件，自动选服务商 + 失败降级。
  * 返回 { provider, id }；全部失败抛 Error（消息里带每家的失败原因）。
  */
-export async function sendViaRotator(env, { from, to, subject, html, text }) {
-  const candidates = await pickProviders(env);
+export async function sendViaRotator(env, { from, to, subject, html, text, attachments, replyTo }) {
+  const atts = Array.isArray(attachments) ? attachments.filter((a) => a && a.content && a.filename) : [];
+  const candidates = await pickProviders(env, { hasAttachments: atts.length > 0 });
   if (!candidates.length) {
-    throw new Error('今日无可用发信额度（四家额度已满或 warm-up 上限已到）');
+    // ★ 带附件却没有可用服务商时，必须**明确报错**，不能退回「只发正文」——
+    //   那正是验收抓到的假成功：接口 200、后台显示发送成功、收件人没有附件。
+    throw new Error(atts.length
+      ? '没有支持附件的可用服务商（今日额度已满或未配置）'
+      : '今日无可用发信额度（四家额度已满或 warm-up 上限已到）');
   }
   const errors = [];
   for (const c of candidates) {
     try {
-      const out = await ADAPTERS[c.name](env, from, to, subject, html, text);
+      const out = await ADAPTERS[c.name](env, from, to, subject, html, text, { attachments: atts, replyTo });
       await incrSent(env, c.name, to.length);
       return { provider: c.name, id: out?.id || null };
     } catch (e) {
