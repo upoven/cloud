@@ -6,15 +6,15 @@
         <a href="https://www.cloudflare.com/" target="_blank">
             <img src="https://img.shields.io/badge/Cloudflare-F38020?labelColor=F38020&amp;color=F38020&amp;logo=cloudflare&amp;logoColor=white" alt="Cloudflare" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud-mail/releases" target="_blank" >
-            <img src="https://img.shields.io/github/v/release/btc3149-bit/cloud-mail?logo=github&amp;logoColor=white" alt="releases" />
+        <a href="https://probrook.com/cloud/releases" target="_blank" >
+            <img src="https://img.shields.io/github/v/release/upoven/cloud?logo=github&amp;logoColor=white" alt="releases" />
         </a>
-        <a href="https://github.com/btc3149-bit/cloud-mail/tree/main?tab=MIT-1-ov-file" target="_blank" >
+        <a href="https://probrook.com/cloud/tree/main?tab=MIT-1-ov-file" target="_blank" >
             <img src="https://img.shields.io/badge/license-MIT-green" />
         </a>  
     </p>
     <p align="center" >
-        <a href="https://skymail.ink">在线演示</a> · <a href="https://docs.skymail.ink">部署文档</a> ·
+        <a href="https://probrook.com">在线演示</a> · <a href="https://probrook.com">部署文档</a> ·
         <a align="center"><a href="README-en.md">English</a> | 简体中文</a>
     </p>
     <p align="center">
@@ -44,12 +44,12 @@
 <table>
   <tr>
     <td valign="middle">
-      <a href="https://github.com/pixtalelab/pixtale">
+      <a href="https://github.com/upoven/cloud">
         <img width="30" src="https://img.022335.xyz/logo.png" alt="Pixtale" align="middle">
       </a>
     </td>
     <td valign="middle">
-      <a href="https://github.com/pixtalelab/pixtale">Pixtale</a>
+      <a href="https://github.com/upoven/cloud">Pixtale</a>
     </td>
     <td valign="middle">
       一个自托管云存储相册应用
@@ -108,7 +108,7 @@
 ## 目录结构
 
 ```
-cloud-mail
+cloud
 ├── mail-worker                    # worker后端项目
 │   ├── src
 │   │   ├── api                    # api接口层
@@ -157,7 +157,7 @@ cloud-mail
 
 ## 交流
 
-[Telegram](https://t.me/+kUCdWP_WLWZjMzQx)
+[Telegram](#)
 
 
 
@@ -173,4 +173,4 @@ cloud-mail
 ![作者微信](docs/contact/qrmvp37l9l4474.png)
 
 - **联系邮箱**：[btc.520@163.com](btc.520@163.com)
-- **Telegram 群**：[https://t.me/+kUCdWP_WLWZjMzQx](https://t.me/+kUCdWP_WLWZjMzQx)
+- **Telegram 群**：[#](#)
