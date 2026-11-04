@@ -174,5 +174,3 @@ cloud
 
 - **联系邮箱**：[btc.520@163.com](btc.520@163.com)
 - **Telegram 群**：[#](#)
-
-<!-- acceptance-test 20261104 -->
